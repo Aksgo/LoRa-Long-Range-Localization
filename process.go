@@ -1,201 +1,248 @@
 package main
 
 import (
-    "fmt"
-    "math"
-    "math/rand"
-    "os"
-    "encoding/csv"
-    "strconv"
-    "sync"
-    "time"
-
-    "gonum.org/v1/gonum/mat"
+	"encoding/csv"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 )
 
-const C = 299_792_458.0
+const C = 299792458.0 // speed of light (m/s)
 
-type GW struct {
-    X, Y float64
+// --- Helper Functions ---
+
+func norm2(x, y float64) float64 {
+	return math.Sqrt(x*x + y*y)
 }
 
-type Sample struct {
-    TrueX, TrueY float64
-    TGW          [3]int64
-    RecX, RecY   float64
-    PosErr       float64
-    Converged    bool
-    Iters        int
-    ResNorm      float64
+func lstsq3x3(J [3][3]float64, r [3]float64) (dx, dy, dt float64, ok bool) {
+	// Solve J * delta = -r using Gaussian elimination
+	A := J
+	b := [3]float64{-r[0], -r[1], -r[2]}
+
+	for i := 0; i < 3; i++ {
+		// pivot
+		maxRow := i
+		for k := i + 1; k < 3; k++ {
+			if math.Abs(A[k][i]) > math.Abs(A[maxRow][i]) {
+				maxRow = k
+			}
+		}
+		A[i], A[maxRow] = A[maxRow], A[i]
+		b[i], b[maxRow] = b[maxRow], b[i]
+
+		if math.Abs(A[i][i]) < 1e-15 {
+			return 0, 0, 0, false
+		}
+
+		// eliminate
+		for k := i + 1; k < 3; k++ {
+			f := A[k][i] / A[i][i]
+			for j := i; j < 3; j++ {
+				A[k][j] -= f * A[i][j]
+			}
+			b[k] -= f * b[i]
+		}
+	}
+
+	// back substitution
+	x := [3]float64{}
+	for i := 2; i >= 0; i-- {
+		sum := b[i]
+		for j := i + 1; j < 3; j++ {
+			sum -= A[i][j] * x[j]
+		}
+		x[i] = sum / A[i][i]
+	}
+	return x[0], x[1], x[2], true
 }
 
-// Gauss-Newton TDOA Solver
-func GaussNewtonTDOA(gwCoords [3]GW, tNs [3]int64, starts [][3]float64, maxIter int, tol float64) (float64, float64, float64, bool, int, float64) {
-    tMeas := [3]float64{}
-    for i := 0; i < 3; i++ {
-        tMeas[i] = float64(tNs[i]) * 1e-9
-    }
+// --- Gauss–Newton TDOA Solver (multi-start) ---
 
-    bestRes := math.Inf(1)
-    var bestX, bestY, bestT0 float64
-    var converged bool
-    var bestIters int
-
-    for _, start := range starts {
-        xx, yy, tt0 := start[0], start[1], start[2]
-
-        for k := 0; k < maxIter; k++ {
-            ranges := [3]float64{}
-            pred := [3]float64{}
-            residuals := [3]float64{}
-            for i := 0; i < 3; i++ {
-                dx := xx - gwCoords[i].X
-                dy := yy - gwCoords[i].Y
-                ranges[i] = math.Hypot(dx, dy)
-                pred[i] = tt0 + ranges[i]/C
-                residuals[i] = pred[i] - tMeas[i]
-            }
-
-            // Jacobian
-            J := mat.NewDense(3, 3, nil)
-            for i := 0; i < 3; i++ {
-                ri := ranges[i]
-                if ri == 0 {
-                    J.Set(i, 0, 0)
-                    J.Set(i, 1, 0)
-                } else {
-                    J.Set(i, 0, (xx-gwCoords[i].X)/(ri*C))
-                    J.Set(i, 1, (yy-gwCoords[i].Y)/(ri*C))
-                }
-                J.Set(i, 2, 1)
-            }
-
-            // Solve least squares
-            r := mat.NewVecDense(3, []float64{-residuals[0], -residuals[1], -residuals[2]})
-            delta := mat.NewVecDense(3, nil)
-            var qr mat.QR
-            qr.Factorize(J)
-            err := qr.SolveTo(delta, false, r)
-            if err != nil {
-                break
-            }
-
-            xx += delta.AtVec(0)
-            yy += delta.AtVec(1)
-            tt0 += delta.AtVec(2)
-
-            normDelta := math.Hypot(math.Hypot(delta.AtVec(0), delta.AtVec(1)), delta.AtVec(2))
-            if normDelta < tol {
-                resnorm := math.Hypot(math.Hypot(residuals[0], residuals[1]), residuals[2])
-                if resnorm < bestRes {
-                    bestX, bestY, bestT0 = xx, yy, tt0
-                    converged = true
-                    bestIters = k + 1
-                    bestRes = resnorm
-                }
-                break
-            }
-        }
-    }
-
-    if bestRes == math.Inf(1) {
-        return math.NaN(), math.NaN(), math.NaN(), false, 0, math.NaN()
-    }
-    return bestX, bestY, bestT0, converged, bestIters, bestRes
+type Solution struct {
+	X, Y, T0   float64
+	Converged  bool
+	Iterations int
+	ResNorm    float64
 }
 
-// Simulate TDOA samples
-func SimulateLoRaWANTDOA(nSamples int, noiseStdNs float64) []Sample {
-    gwCoords := [3]GW{{0, 0}, {1000, 0}, {500, 866.0254}}
-    samples := make([]Sample, nSamples)
+func GaussNewtonTDOAMultiStart(gwCoords [3][2]float64, t_ns [3]float64, starts [][2]float64, maxIter int, tol float64) Solution {
+	tMeas := [3]float64{}
+	for i := 0; i < 3; i++ {
+		tMeas[i] = t_ns[i] * 1e-9
+	}
 
-    rng := rand.New(rand.NewSource(31415))
+	best := Solution{ResNorm: math.Inf(1)}
 
-    var wg sync.WaitGroup
-    for s := 0; s < nSamples; s++ {
-        wg.Add(1)
-        go func(s int) {
-            defer wg.Done()
-            trueX := rng.Float64()*1400 - 200
-            trueY := rng.Float64()*1900 - 500
-            t0 := rng.Float64()
+	for _, start := range starts {
+		x, y := start[0], start[1]
+		centroid := [2]float64{x, y}
 
-            arrivalTimes := [3]float64{}
-            tNs := [3]int64{}
-            noisyNs := [3]int64{}
-            for i := 0; i < 3; i++ {
-                dist := math.Hypot(gwCoords[i].X-trueX, gwCoords[i].Y-trueY)
-                arrivalTimes[i] = t0 + dist/C
-                tNs[i] = int64(math.Round(arrivalTimes[i] * 1e9))
-                noisyNs[i] = tNs[i] + int64(rng.NormFloat64()*noiseStdNs)
-            }
+		minD := math.Inf(1)
+		for _, gw := range gwCoords {
+			d := norm2(gw[0]-centroid[0], gw[1]-centroid[1])
+			if d < minD {
+				minD = d
+			}
+		}
+		t0 := min(tMeas[0], min(tMeas[1], tMeas[2])) - minD/C
 
-            starts := [][3]float64{
-                {500, 288.675, 0}, // centroid
-                {gwCoords[0].X, gwCoords[0].Y, 0},
-                {gwCoords[1].X, gwCoords[1].Y, 0},
-                {gwCoords[2].X, gwCoords[2].Y, 0},
-            }
+		xx, yy, tt0 := x, y, t0
 
-            recX, recY, _, converged, iters, resnorm := GaussNewtonTDOA(gwCoords, noisyNs, starts, 100, 1e-9)
-            posErr := math.Hypot(recX-trueX, recY-trueY)
+		for k := 0; k < maxIter; k++ {
+			var ranges [3]float64
+			for i := 0; i < 3; i++ {
+				ranges[i] = norm2(xx-gwCoords[i][0], yy-gwCoords[i][1])
+			}
 
-            if !converged || resnorm > 1e-7 || posErr > 5000 {
-                recX, recY, posErr, converged = math.NaN(), math.NaN(), math.NaN(), false
-            }
+			var pred, residuals [3]float64
+			for i := 0; i < 3; i++ {
+				pred[i] = tt0 + ranges[i]/C
+				residuals[i] = pred[i] - tMeas[i]
+			}
 
-            samples[s] = Sample{
-                TrueX:     trueX,
-                TrueY:     trueY,
-                TGW:       noisyNs,
-                RecX:      recX,
-                RecY:      recY,
-                PosErr:    posErr,
-                Converged: converged,
-                Iters:     iters,
-                ResNorm:   resnorm,
-            }
-        }(s)
-    }
-    wg.Wait()
-    return samples
+			var J [3][3]float64
+			for i := 0; i < 3; i++ {
+				ri := ranges[i]
+				if ri != 0 {
+					J[i][0] = (xx - gwCoords[i][0]) / (ri * C)
+					J[i][1] = (yy - gwCoords[i][1]) / (ri * C)
+				}
+				J[i][2] = 1.0
+			}
+
+			dx, dy, dt, ok := lstsq3x3(J, residuals)
+			if !ok {
+				break
+			}
+
+			xx += dx
+			yy += dy
+			tt0 += dt
+
+			if math.Sqrt(dx*dx+dy*dy+dt*dt) < tol {
+				resNorm := 0.0
+				for _, r := range residuals {
+					resNorm += r * r
+				}
+				resNorm = math.Sqrt(resNorm)
+				if resNorm < best.ResNorm {
+					best = Solution{xx, yy, tt0, true, k + 1, resNorm}
+				}
+				break
+			}
+		}
+	}
+	return best
 }
 
-// Write CSV
-func WriteCSV(filename string, samples []Sample) {
-    f, err := os.Create(filename)
-    if err != nil {
-        panic(err)
-    }
-    defer f.Close()
+// --- Dataset Processor ---
 
-    w := csv.NewWriter(f)
-    defer w.Flush()
+func ProcessTDOADataset(csvPath string) []map[string]interface{} {
+	file, err := os.Open(csvPath)
+	if err != nil {
+		log.Fatalf("failed to open CSV: %v", err)
+	}
+	defer file.Close()
 
-    header := []string{"sample_id","true_x_m","true_y_m","t_gw1_ns","t_gw2_ns","t_gw3_ns","recov_x_m","recov_y_m","pos_error_m","solver_converged","solver_iters","solver_resnorm_s"}
-    _ = w.Write(header)
+	reader := csv.NewReader(file)
+	rows, err := reader.ReadAll()
+	if err != nil {
+		log.Fatalf("failed to read CSV: %v", err)
+	}
 
-    for i, s := range samples {
-        _ = w.Write([]string{
-            strconv.Itoa(i + 1),
-            fmt.Sprintf("%.6f", s.TrueX),
-            fmt.Sprintf("%.6f", s.TrueY),
-            strconv.FormatInt(s.TGW[0], 10),
-            strconv.FormatInt(s.TGW[1], 10),
-            strconv.FormatInt(s.TGW[2], 10),
-            fmt.Sprintf("%.6f", s.RecX),
-            fmt.Sprintf("%.6f", s.RecY),
-            fmt.Sprintf("%.6f", s.PosErr),
-            strconv.FormatBool(s.Converged),
-            strconv.Itoa(s.Iters),
-            fmt.Sprintf("%.6f", s.ResNorm),
-        })
-    }
+	header := rows[0]
+	data := rows[1:]
+
+	col := func(name string) int {
+		for i, h := range header {
+			if h == name {
+				return i
+			}
+		}
+		log.Fatalf("missing column: %s", name)
+		return -1
+	}
+
+	// Extract gateway coordinates
+	gwCoords := [3][2]float64{}
+	for i := 0; i < 3; i++ {
+		x, _ := strconv.ParseFloat(data[0][col(fmt.Sprintf("gw%d_x_m", i+1))], 64)
+		y, _ := strconv.ParseFloat(data[0][col(fmt.Sprintf("gw%d_y_m", i+1))], 64)
+		gwCoords[i] = [2]float64{x, y}
+	}
+
+	results := []map[string]interface{}{}
+
+	for i, row := range data {
+		var t_ns [3]float64
+		for j := 0; j < 3; j++ {
+			t_ns[j], _ = strconv.ParseFloat(row[col(fmt.Sprintf("t_gw%d_ns", j+1))], 64)
+		}
+
+		starts := [][2]float64{
+			{(gwCoords[0][0] + gwCoords[1][0] + gwCoords[2][0]) / 3,
+				(gwCoords[0][1] + gwCoords[1][1] + gwCoords[2][1]) / 3},
+			{gwCoords[0][0], gwCoords[0][1]},
+			{gwCoords[1][0], gwCoords[1][1]},
+			{gwCoords[2][0], gwCoords[2][1]},
+		}
+
+		sol := GaussNewtonTDOAMultiStart(gwCoords, t_ns, starts, 100, 1e-9)
+
+		res := map[string]interface{}{
+			"sample_id":         i + 1,
+			"recov_x_m":         sol.X,
+			"recov_y_m":         sol.Y,
+			"solver_converged":  sol.Converged,
+			"solver_iters":      sol.Iterations,
+			"solver_resnorm_s":  sol.ResNorm,
+		}
+		results = append(results, res)
+	}
+
+	outPath := "tdoa_results.csv"
+	f, err := os.Create(outPath)
+	if err != nil {
+		log.Fatalf("failed to create output CSV: %v", err)
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	writer.Write([]string{"sample_id", "recov_x_m", "recov_y_m", "solver_converged", "solver_iters", "solver_resnorm_s"})
+	for _, r := range results {
+		writer.Write([]string{
+			fmt.Sprintf("%v", r["sample_id"]),
+			fmt.Sprintf("%v", r["recov_x_m"]),
+			fmt.Sprintf("%v", r["recov_y_m"]),
+			fmt.Sprintf("%v", r["solver_converged"]),
+			fmt.Sprintf("%v", r["solver_iters"]),
+			fmt.Sprintf("%v", r["solver_resnorm_s"]),
+		})
+	}
+
+	abs, _ := filepath.Abs(outPath)
+	fmt.Printf("✅ Results saved to: %s\n", abs)
+	return results
 }
+
+// --- Main Entry Point ---
 
 func main() {
-    start := time.Now()
-    samples := SimulateLoRaWANTDOA(100, 5.0)
-    WriteCSV("lorawan_tdoa_samples_go.csv", samples)
-    fmt.Println("Simulation complete in", time.Since(start))
+	inputCSV := "lorawan_data.csv"
+	ProcessTDOADataset(inputCSV)
+}
+
+// --- Utilities ---
+
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
