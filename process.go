@@ -12,7 +12,6 @@ import (
 
 const C = 299792458.0 // speed of light (m/s)
 
-// --- Helper Functions ---
 
 func norm2(x, y float64) float64 {
 	return math.Sqrt(x*x + y*y)
@@ -227,18 +226,15 @@ func ProcessTDOADataset(csvPath string) []map[string]interface{} {
 	}
 
 	abs, _ := filepath.Abs(outPath)
-	fmt.Printf("✅ Results saved to: %s\n", abs)
+	fmt.Printf("Results saved to: %s\n", abs)
 	return results
 }
 
-// --- Main Entry Point ---
 
 func main() {
 	inputCSV := "lorawan_data.csv"
 	ProcessTDOADataset(inputCSV)
 }
-
-// --- Utilities ---
 
 func min(a, b float64) float64 {
 	if a < b {

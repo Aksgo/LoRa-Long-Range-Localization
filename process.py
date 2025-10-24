@@ -3,7 +3,6 @@ import pandas as pd
 import math
 from pathlib import Path
 
-# --- Constants ---
 C = 299_792_458.0  # speed of light (m/s)
 
 # --- Gauss–Newton TDOA Solver (multi-start) ---
@@ -112,11 +111,10 @@ def process_tdoa_dataset(csv_path):
     out_df = pd.DataFrame(results)
     out_path = Path("tdoa_results.csv")
     out_df.to_csv(out_path, index=False)
-    print(f"✅ Results saved to: {out_path.resolve()}")
+    print(f"Results saved to: {out_path.resolve()}")
     print(out_df.head())
     return out_df
 
-# --- Main Entry Point ---
 if __name__ == "__main__":
     input_csv = "lorawan_data.csv"
     df_results = process_tdoa_dataset(input_csv)
